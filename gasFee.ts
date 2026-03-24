@@ -1,10 +1,10 @@
 /**
  * 计算Gas费用价值
  *
- * 计算公式: gasLimit * gasPrice * ethUsdPrice
+ * 计算公式: gasLimit * gasPrice * nativeTokenPrice
  * - gasLimit: 交易使用的gas数量
  * - gasPrice: Gas价格 (单位: Gwei)
- * - ethUsdPrice: ETH/USD价格
+ * - nativeTokenPrice: 原生代币价格 (以目标ERC20计价)
  */
 
 export interface GasPriceInfo {
@@ -14,41 +14,65 @@ export interface GasPriceInfo {
 }
 
 /**
- * 计算指定gas量价值多少USDT
- * @param gasLimit - Gas数量 (如 150000)
- * @param gasPriceGwei - Gas价格 (单位: Gwei)
- * @param ethUsdPrice - ETH/USD价格
- * @returns USDT价值
+ * 从链上获取ERC20代币的decimals
+ * @param rpcUrl - RPC地址
+ * @param tokenAddress - ERC20代币合约地址
+ * @returns decimals
  */
-export function calculateGasFeeUsdt(
-  gasLimit: number,
-  gasPriceGwei: number,
-  ethUsdPrice: number
-): number {
-  // Gwei 转 ETH: 1 Gwei = 10^-9 ETH
-  const gasPriceEth = gasPriceGwei * 1e-9;
-
-  // 计算总费用 (ETH)
-  const totalEth = BigInt(gasLimit) * BigInt(gasPriceGwei * 1e9);
-
-  // 转换为USDT
-  const usdtValue = Number(totalEth) * 1e-18 * ethUsdPrice;
-
-  return usdtValue;
+export async function getTokenDecimals(rpcUrl: string, tokenAddress: string): Promise<number> {
+  // ERC20 decimals() 函数选择器: 0x313ce567
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'eth_call',
+      params: [
+        {
+          to: tokenAddress,
+          data: '0x313ce567'
+        },
+        'latest'
+      ],
+      id: 1
+    })
+  });
+  const data = await response.json() as { result: string };
+  return parseInt(data.result, 16);
 }
 
 /**
- * 从API获取当前Gas价格和ETH价格，计算费用
- * @param gasLimit - Gas数量
- * @returns USDT价值
+ * 计算指定gas量价值多少ERC20代币
+ * @param gasLimit - Gas数量 (如 150000)
+ * @param gasPriceGwei - Gas价格 (单位: Gwei)
+ * @param nativeTokenPrice - 原生代币价格 (以目标ERC20计价)
+ * @param tokenDecimals - 目标ERC20代币精度 (如 USDT=6, DAI=18)
+ * @returns 代币价值 (人类可读格式)
  */
+export function calculateGasFeeInToken(
+  gasLimit: number,
+  gasPriceGwei: number,
+  nativeTokenPrice: number,
+  tokenDecimals: number
+): number {
+  // 计算总费用 (Wei)
+  const totalWei = BigInt(gasLimit) * BigInt(gasPriceGwei * 1e9);
+
+  // Wei -> 原生代币 (÷10^18, 因为原生代币始终是18位精度)
+  // 原生代币 -> 目标ERC20代币价值
+  const tokenValue = Number(totalWei) * 1e-18 * nativeTokenPrice;
+
+  return tokenValue;
+}
+
 // 环境配置
 export interface ChainConfig {
   name: string;
   rpc: string;
-  nativeToken: string; // 代币符号
+  nativeToken: string; // 原生代币符号
   priceApi: string; // 价格API
   priceSymbol: string; // 价格API返回的symbol
+  feeTokenAddress: string; // 费用代币合约地址 (ERC20)
 }
 
 export const CHAIN_CONFIGS: { [key: string]: ChainConfig } = {
@@ -58,7 +82,8 @@ export const CHAIN_CONFIGS: { [key: string]: ChainConfig } = {
     rpc: 'https://bsc-dataseed1.binance.org',
     nativeToken: 'BNB',
     priceApi: 'https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT',
-    priceSymbol: 'BNB'
+    priceSymbol: 'BNB',
+    feeTokenAddress: '0x55d398326f99059fF775485246999027B3197955' // BSC USDT
   },
   // Base Sepolia 测试网
   baseSepolia: {
@@ -66,7 +91,8 @@ export const CHAIN_CONFIGS: { [key: string]: ChainConfig } = {
     rpc: 'https://sepolia.base.org',
     nativeToken: 'ETH',
     priceApi: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
-    priceSymbol: 'ETH'
+    priceSymbol: 'ETH',
+    feeTokenAddress: '0x' // 测试网无标准USDT，需替换
   },
   // Base 主网
   base: {
@@ -74,7 +100,8 @@ export const CHAIN_CONFIGS: { [key: string]: ChainConfig } = {
     rpc: 'https://mainnet.base.org',
     nativeToken: 'ETH',
     priceApi: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
-    priceSymbol: 'ETH'
+    priceSymbol: 'ETH',
+    feeTokenAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' // Base USDC
   }
 };
 
@@ -107,25 +134,37 @@ export async function getTokenPriceFromBinance(priceApi: string): Promise<number
   return parseFloat(data.price);
 }
 
-export async function calculateGasFeeUsdtFromApi(
+/**
+ * 从API获取当前Gas价格和代币价格，计算费用
+ * @param gasLimit - Gas数量
+ * @param chain - 链名称
+ * @param tokenAddress - 可选，自定义ERC20代币地址（覆盖链默认配置）
+ * @returns ERC20代币价值
+ */
+export async function calculateGasFeeFromApi(
   gasLimit: number,
-  chain: string = 'bsc' // 默认 BSC，可选: bsc, baseSepolia, base
+  chain: string = 'bsc',
+  tokenAddress?: string
 ): Promise<number> {
   const config = CHAIN_CONFIGS[chain] || CHAIN_CONFIGS.bsc;
+  const feeTokenAddr = tokenAddress || config.feeTokenAddress;
 
-  // 从 Binance 获取代币价格
-  const tokenUsdPrice = await getTokenPriceFromBinance(config.priceApi);
-
-  // 从RPC获取Gas价格
-  const gasPriceGwei = await getGasPriceFromRpc(config.rpc);
+  // 并行获取: 代币价格、Gas价格、代币精度
+  const [tokenUsdPrice, gasPriceGwei, decimals] = await Promise.all([
+    getTokenPriceFromBinance(config.priceApi),
+    getGasPriceFromRpc(config.rpc),
+    getTokenDecimals(config.rpc, feeTokenAddr)
+  ]);
 
   console.log('=== API Response ===');
   console.log('Chain:', config.name);
   console.log('Token Price (Binance):', tokenUsdPrice);
   console.log('Gas Price (Gwei):', gasPriceGwei);
+  console.log('Fee Token Address:', feeTokenAddr);
+  console.log('Fee Token Decimals:', decimals);
   console.log('===================');
 
-  return calculateGasFeeUsdt(gasLimit, gasPriceGwei, tokenUsdPrice);
+  return calculateGasFeeInToken(gasLimit, gasPriceGwei, tokenUsdPrice, decimals);
 }
 
 // 示例用法
@@ -133,16 +172,19 @@ if (require.main === module) {
   const gasLimit = 150000;
   // 从命令行或环境变量获取 chain: bsc, baseSepolia, base
   const chain = process.env.CHAIN || process.argv[2] || 'bsc';
+  // 可选：自定义代币地址
+  const tokenAddress = process.env.TOKEN_ADDRESS || process.argv[3];
 
   console.log(`\n=== Config ===`);
   console.log(`Chain: ${chain}`);
+  if (tokenAddress) console.log(`Token Address: ${tokenAddress}`);
   console.log(`============\n`);
 
-  calculateGasFeeUsdtFromApi(gasLimit, chain)
-    .then(usdtValue => {
+  calculateGasFeeFromApi(gasLimit, chain, tokenAddress)
+    .then(tokenValue => {
       console.log(`\n=== Result ===`);
       console.log(`Gas Limit: ${gasLimit}`);
-      console.log(`USDT Value: $${usdtValue.toFixed(4)}`);
+      console.log(`Token Value: ${tokenValue.toFixed(6)}`);
     })
     .catch(console.error);
 }
